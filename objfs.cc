@@ -1436,12 +1436,12 @@ void write_inode(fs_obj *f)
     in->rdev = f->rdev;
     in->mtime = f->mtime;
 
+    // TODO: how do we save time here?
+    const std::unique_lock<std::mutex> lock(log_mutex);
     if (written_inodes.find(in->inum) != written_inodes.end()){
-        const std::unique_lock<std::mutex> lock(log_mutex);
         memcpy(written_inodes[in->inum], rec, len);
     } 
     else {
-        const std::unique_lock<std::mutex> lock(log_mutex);
         memcpy(meta_log_tail, rec, len);
         written_inodes[in->inum] = meta_log_tail;
         meta_log_tail = len + (char*)meta_log_tail;
