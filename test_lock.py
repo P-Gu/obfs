@@ -61,7 +61,7 @@ class tests(unittest.TestCase):
                                     msg='readdir %s: %d results (should be 0)' % (path, len(des)))
         print("quit id: " + str(tid))
     
-    def test_01_mkdir(self):
+    '''def test_01_mkdir(self):
         print('Test 1, mkdir (top level):')
 
         dirs_1 = (('/test' + str(s), 0o755) for s in range(10000))
@@ -99,6 +99,7 @@ class tests(unittest.TestCase):
                 self.assertOK(v, 'readdir %s' % path)
                 self.assertEqual(len(des), 0,
                                     msg='readdir %s: %d results (should be 0)' % (path, len(des)))
+        obj.teardown()'''
 
     def do_write(self, path, filesz, opsz):
         v = obj.create(path, 0o777)
@@ -168,6 +169,9 @@ class tests(unittest.TestCase):
 
         obj.sync()
         obj.teardown()
+        print("TEARDOWN!\n")
+        time.sleep(5)
+        
         obj.init(prefix)
         
         for n in filesizes:

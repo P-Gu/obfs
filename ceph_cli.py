@@ -11,12 +11,12 @@ s3 = boto3.resource('s3', endpoint_url=url, use_ssl=False,
 GB = 1024 ** 3
 config = TransferConfig(multipart_threshold=5 * GB, max_concurrency=10, use_threads=True)
 
-'''
-for bucket in s3.buckets.all():
-    print(bucket.name)
-    for my_bucket_object in bucket.objects.all():
-        print(my_bucket_object)
-        '''
+print("find bucket1")
+bucket = s3.Bucket('bucket1')
+for bucket_object in bucket.objects.all():
+    print(bucket_object.key)
+    bucket_object.delete()
+
 
 bucket = s3.Bucket('bucket1')
 bucket.objects.all().delete()

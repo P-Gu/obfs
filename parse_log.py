@@ -4,75 +4,47 @@ from IPython.display import display
 
 def main():
     data = []
-    data_2 = []
-    lines = open('/mnt/ramdisk/log.txt', 'r').readlines()
+    lines = open('/mnt/ramdisk/log_ckpt2.txt', 'r').readlines()
 
-    s3_put = False
-    maybe_write = False
-    write_everything_out = False
-    fs_write = False
-    times = {}
-    #times_2 = {"first": 0, "make_record": 0, "maybe_write": 0}
+    w_locs = ["WRITE1", "WRITE2", "WRITE3", "WRITE4", "WRITE5", "WRITE6"]
+    r_locs = ["READ1", "READ2", "READ3", "READ4", "READ5"]
+    rd_locs = ["RD1", "RD2", "RD3", "RD4", "RD5", "RD6"]
+    w_times = {}
+    r_times = {}
+    rd_times = {}
+    for loc in w_locs:
+        w_times[loc] = []
+    for loc in r_locs:
+        r_times[loc] = []
+    for loc in rd_locs:
+        rd_times[loc] = []
     for line in lines:
-        pairs = line.strip().split(';')
-        #print(line)
-        if "PATH_2_INUM" in line:
-            times["path_2_inum"] = float(pairs[0].split(":")[1].strip()) #- times["s3_put"] - times["write_everything_out"] - times["maybe_write"] - times["make_record"]
-            continue
-        elif "BEFORE_MAKE_RECORD" in line:
-            #print(times)
-            times["before_make_record"] = float(pairs[0].split(":")[1].strip()) - times["path_2_inum"]
-            continue
-        elif "BEFORE_MAYBE_WRITE" in line:
-            times["before_maybe_write"] = float(pairs[0].split(":")[1].strip()) - times["before_make_record"] - times["make_record"] - times["path_2_inum"]
-            continue
-        elif "AFTER_MAKE_RECORD" in line:
-            times["make_record"] = float(pairs[0].split(":")[1].strip()) - times["before_make_record"] - times["path_2_inum"]
-            continue
-        elif "AFTER_MAYBE_WRITE" in line:
-            times["maybe_write"] = float(pairs[0].split(":")[1].strip()) - times["before_make_record"] - times["make_record"] - times["before_maybe_write"] - times["path_2_inum"]
-            data.append(times)
-            times = {}
-            continue
-        elif "WRITE_EVERYTHING_OUT" in line:
-            times["write_everything_out"] = float(pairs[0].split(":")[1].strip()) #- times["s3_put"]
-            continue
-        elif "S3_PUT" in line:
-            times["s3_put"] = float(pairs[0].split(":")[1].strip())
-            continue
+        loc_and_pairs = line.strip().split('|')
+        pairs = loc_and_pairs[1].strip().split(',')
+        time = float(pairs[0].split(':')[1])
+        loc = loc_and_pairs[0]
+        if loc in w_locs:
+            w_times[loc].append(time)
+        elif loc in r_locs:
+            r_times[loc].append(time)
+        else:
+            rd_times[loc].append(time)
+    
+    for loc in w_locs:
+        print(loc, sum(w_times[loc]))
+    for loc in r_locs:
+        print(loc, sum(r_times[loc]))
+    for loc in rd_locs:
+        print(loc, len(rd_times[loc]))
+        print(loc, sum(rd_times[loc]))
+
        
-    df = pd.DataFrame(data=data)    
-    display(df)
-    df.to_csv('log/log.csv')
+    #df = pd.DataFrame(data=data)    
+    #display(df)
+    #df.to_csv('log/log.csv')
 
 if __name__ == "__main__":
     main()
-'''
-        row = []
-        for pair in pairs:
-            row.append(tuple([entry.strip() for entry in pair.split(':')]))
-        #print(line)
-        row = dict(row)
-        op = row['Function']
-        if op == "fs_write":
-            times["fs_write"] = float(row["Time"]) - times["maybe_write"] - times["make_record"] - times["write_everything_out"] - times["s3_put"]
-            #print(times["make_record"])
-            #data.append(times)
-            fs_write = False
-            
-        elif op == "maybe_write" and fs_write:
-            times["maybe_write"] = float(row["Time"]) - times["write_everything_out"] - times["s3_put"]
-        elif op == "write_everything_out" and fs_write:
-            times["write_everything_out"] = float(row["Time"]) - times["s3_put"]
-        elif op == "s3_put" and fs_write:
-            times["s3_put"] = float(row["Time"])
-        elif op == "make_record" and fs_write:
-            times["make_record"] = float(row["Time"])
-            #print(times["make_record"])
-'''
-        #else:
-            #times = {}
-            #times = {"maybe_write": 0, "write_everything_out": 0, "s3_put": 0, "make_record": 0}
     
 
             

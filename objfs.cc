@@ -481,6 +481,33 @@ size_t fs_link::serialize(std::ostream &s)
     return bytes;
 }
 
+
+class Logger {
+    std::string log_path;
+    std::fstream file_stream;
+
+public:
+    Logger(std::string path);
+    ~Logger();
+    void log(std::string info);
+};
+
+
+Logger::Logger(std::string path){
+    file_stream.open(path, std::fstream::out | std::fstream::trunc);
+}
+
+Logger::~Logger(void){
+    file_stream.close();
+}
+
+void Logger::log(std::string info) {
+    const std::unique_lock<std::mutex> lock(logger_mutex);
+    file_stream << info;
+}
+
+Logger* logger = new Logger("/mnt/ramdisk/log_ckpt2.txt");
+
 /****************
  * file header format
  */
@@ -992,6 +1019,14 @@ void serialize_all(void)
     // itable.str().c_str(), itable_len
 }
 
+struct gc_info {
+    uint32_t objnum;
+    int64_t  file_offset;
+    uint32_t obj_offset;
+    uint32_t len;
+};
+
+
 
 /* 
    when do we decide to write? 
@@ -1112,8 +1147,11 @@ void maybe_write(struct objfs *fs)
 {
     log_mutex.lock();
     if ((meta_offset() > meta_log_len) || (data_offset() > data_log_len)) {    
-        // TODO: maybe a thread pool?
-        std::thread (write_everything_out,fs).detach();
+        {
+            std::unique_lock<std::mutex> sync_lk(sync_mutex);
+            writing_log_count++;
+        }
+        std::thread (write_everything_out, fs).detach();
     }
     else {
         log_mutex.unlock();
@@ -1142,7 +1180,7 @@ int do_read(struct objfs *fs, int index, void *buf, size_t len, size_t offset, b
 {
     char key[256];
     sprintf(key, "%s.%08x%s", fs->prefix, index, ckpt ? ".ck" : "");
-    struct iovec iov = {.iov_base = buf, .iov_len = (size_t)len};
+    struct iovec iov = {.iov_base = buf, .iov_len = len};
     std::future<S3Status> status = std::async(std::launch::deferred, &s3_target::s3_get, fs->s3, key, offset, len, &iov, 1);
     if (S3StatusOK != status.get()){
         return -1;
@@ -1188,26 +1226,158 @@ int get_offset(struct objfs *fs, int index, bool ckpt)
 //
 int read_data(struct objfs *fs, void *buf, int index, off_t offset, size_t len)
 {
+    auto t0 = std::chrono::system_clock::now();
     log_mutex.lock();
     if (index == this_index) {
         len = std::min(len, data_offset() - offset);
         memcpy(buf, offset + (char*)data_log_head, len);
         log_mutex.unlock();
+        auto t1 = std::chrono::system_clock::now();
+        std::chrono::duration<double> diff1 = t1 - t0;
+        std::string info = "RD1|Time: " + std::to_string(diff1.count()) + ", Len: " + std::to_string(len) + "\n";
+        logger->log(info);
         return len;
     }
     log_mutex.unlock();
-    old_log_mutex.lock_shared();
+    auto t1 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff1 = t1 - t0;
+    std::string info = "RD1|Time: " + std::to_string(diff1.count()) + ", Len: " + std::to_string(len) + "\n";
+    logger->log(info);
+    buffer_mutex.lock_shared();
     if (meta_log_buffer.find(index) != meta_log_buffer.end()) {
         len = std::min(len, data_log_sizes[index] - offset);
         memcpy(buf, offset + (char*)data_log_buffer[index], len);
-        old_log_mutex.unlock_shared();
+        buffer_mutex.unlock_shared();
+        auto t2 = std::chrono::system_clock::now();
+        std::chrono::duration<double> diff2 = t2 - t1;
+        info = "RD2|Time: " + std::to_string(diff2.count()) + ", Len: " + std::to_string(len) + "\n";
+        logger->log(info);
         return len;
     }
-    old_log_mutex.unlock_shared();
-    size_t n = get_offset(fs, index, false);
-    if (n < 0)
-        return n;
-    return do_read(fs, index, buf, len, offset + n, false);
+    buffer_mutex.unlock_shared();
+    auto t2 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff2 = t2 - t1;
+    info = "RD2|Time: " + std::to_string(diff2.count()) + ", Len: " + std::to_string(len) + "\n";
+    logger->log(info);
+
+    int data_len = get_datalen(fs, index, false);
+    int hdr_len = get_offset(fs, index, false);
+
+    if (offset + len > data_len) return -1;
+    
+    std::set<int> empty_extent_offsets;
+    std::map<int, void *> *data_extents;
+
+    auto t3 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff3 = t3 - t2;
+    info = "RD3|Time: " + std::to_string(diff3.count()) + ", Len: " + std::to_string(len) + "\n";
+    logger->log(info);
+
+    cache_mutex.lock_shared();
+    int left_do_read_offset, right_do_read_offset;
+    int cur_ext_offset = ((int)offset / f_bsize) * f_bsize;
+    left_do_read_offset = cur_ext_offset;
+    if (data_log_cache.find(index) != data_log_cache.end()) {
+        data_extents = data_log_cache[index];
+
+        while (cur_ext_offset < offset + len) {
+            if (data_extents->find(cur_ext_offset) == data_extents->end()) {
+                empty_extent_offsets.insert(cur_ext_offset);
+            }
+            cur_ext_offset += f_bsize;
+        }
+    } else {
+        while (cur_ext_offset < offset + len) {
+            empty_extent_offsets.insert(cur_ext_offset);
+            cur_ext_offset += f_bsize;
+        }
+        data_extents = new std::map<int, void *>;
+        data_log_cache[index] = data_extents;
+    }
+    right_do_read_offset = std::min(data_len, cur_ext_offset);
+    
+    int cur_ext_read_size;
+    if (empty_extent_offsets.size() == 0) {
+        int bytes_read = 0;
+        cur_ext_offset = ((int)offset / f_bsize) * f_bsize;
+        auto it = data_extents->find(cur_ext_offset);
+        void *cur_ext = it->second;
+        cur_ext_read_size = std::min(cur_ext_offset + f_bsize - (int)offset, (int)len);
+        memcpy(buf, cur_ext + offset - cur_ext_offset, cur_ext_read_size);
+        buf += cur_ext_read_size;
+        len -= cur_ext_read_size;
+        bytes_read += cur_ext_read_size;
+        
+        while (len >= f_bsize) {
+            cur_ext_offset += f_bsize;
+            it = data_extents->find(cur_ext_offset);
+            cur_ext = it->second;
+            memcpy(buf, cur_ext, f_bsize);
+            buf += f_bsize;
+            len -= f_bsize;
+            bytes_read += f_bsize;
+        }
+        if (len > 0) {
+            cur_ext_offset += f_bsize;
+            it = data_extents->find(cur_ext_offset);
+            cur_ext = it->second;
+            memcpy(buf, cur_ext, len);
+            bytes_read += len;
+        }
+        cache_mutex.unlock_shared();
+        auto t4 = std::chrono::system_clock::now();
+        std::chrono::duration<double> diff4 = t4 - t3;
+        info = "RD4|Time: " + std::to_string(diff4.count()) + ", Len: " + std::to_string(len) + "\n";
+        logger->log(info);
+        return bytes_read;
+    }
+    cache_mutex.unlock_shared();
+
+    auto t4 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff4 = t4 - t3;
+    info = "RD4|Time: " + std::to_string(diff4.count()) + ", Len: " + std::to_string(len) + "\n";
+    logger->log(info);
+
+    void *data_log = malloc(sizeof(char) * (right_do_read_offset - left_do_read_offset));
+    
+    //int do_read_resp = do_read(fs, index, data_log, data_len, hdr_len, false);
+    int do_read_resp = do_read(fs, index, data_log, right_do_read_offset - left_do_read_offset, hdr_len + left_do_read_offset, false);
+    if (do_read_resp < 0){
+        return -1;
+    }
+    
+    auto t5 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff5 = t5 - t4;
+    info = "RD5|Time: " + std::to_string(diff5.count()) + ", Len: " + std::to_string(len) + "\n";
+    logger->log(info);
+    cache_mutex.lock();
+
+    int n;
+    void *cur_ext;
+    for(std::set<int>::iterator it = empty_extent_offsets.begin(); it != empty_extent_offsets.end(); ++it) {
+        n = *it;
+        int cur_ext_write_size = std::min(data_len - n, f_bsize);
+        cur_ext = malloc(sizeof(char) * f_bsize);
+        memcpy(cur_ext, data_log + n - left_do_read_offset, cur_ext_write_size);
+        (*data_extents)[n] = cur_ext;
+        std::pair <int, int>* fifo_entry = new std::pair<int, int>;
+        fifo_entry->first = index;
+        fifo_entry->second = n; 
+        fifo_queue.push(fifo_entry);
+        fifo_size++;
+    }
+    fifo_cv.notify_all();
+    cache_mutex.unlock();
+
+    memcpy(buf, data_log + offset - left_do_read_offset, len);
+
+    free(data_log);
+    data_log = NULL;
+    auto t6 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff6 = t6 - t5;
+    info = "RD6|Time: " + std::to_string(diff6.count()) + ", Len: " + std::to_string(len) + "\n";
+    logger->log(info);
+    return len;
 }
 
 static std::vector<std::string> split(const std::string& s, char delimiter)
@@ -1352,7 +1522,15 @@ int fs_readdir(const char *path, void *ptr, fuse_fill_dir_t filler,
 int fs_write(const char *path, const char *buf, size_t len,
 	     off_t offset, struct fuse_file_info *fi)
 {
+    auto t0 = std::chrono::system_clock::now();
+    std::shared_lock ckpting_lock(ckpting_mutex);
     struct objfs *fs = (struct objfs*) fuse_get_context()->private_data;
+    {
+        std::unique_lock<std::mutex> sync_lk(sync_mutex);
+        writing_log_count++;
+    }
+    auto t1 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff1 = t1 - t0;
 
     int inum;
     if (fi->fh != 0) {
@@ -1363,8 +1541,8 @@ int fs_write(const char *path, const char *buf, size_t len,
     if (inum < 0){
         return inum;
     }
-
-    inode_mutex.lock_shared();
+    t0 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff2 = t0 - t1;
     fs_obj *obj = inode_map[inum];
     inode_mutex.unlock_shared();
     if (obj->type != OBJ_FILE){
@@ -1376,6 +1554,8 @@ int fs_write(const char *path, const char *buf, size_t len,
     f->read_lock();
     off_t new_size = std::max((off_t)(offset+len), (off_t)(f->size));
     f->read_unlock();
+    t1 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff3 = t1 - t0;
 
     int hdr_bytes = sizeof(log_record) + sizeof(log_data);
     char hdr[hdr_bytes];
@@ -1384,6 +1564,22 @@ int fs_write(const char *path, const char *buf, size_t len,
 
     lr->type = LOG_DATA;
     lr->len = sizeof(log_data);
+
+    {
+        std::unique_lock gc_lk(started_gc_mutex);
+        if (started_gc) {
+            if (writes_after_ckpt.find(inum) == writes_after_ckpt.end()) {
+                std::map<int, int> *writes = new std::map<int, int>;
+                (*writes)[offset] = (int)len;
+                writes_after_ckpt[inum] = writes;
+            } else {
+                std::map<int, int> *writes = writes_after_ckpt.at(inum);
+                (*writes)[offset] = (int)len;
+            }
+        }
+    }
+    t0 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff4 = t0 - t1;
 
     log_mutex.lock();
     size_t obj_offset = data_offset();
@@ -1410,9 +1606,32 @@ int fs_write(const char *path, const char *buf, size_t len,
     f->extents.update(offset, e);
     f->write_unlock();
 
+
     write_inode(f);
+    log_mutex.unlock();
+    t1 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff5 = t1 - t0;
     maybe_write(fs);
 
+    {
+        std::unique_lock<std::mutex> sync_lk(sync_mutex);
+        writing_log_count--;
+    }
+    t0 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff6 = t0 - t1;
+
+    std::string info = "WRITE1|Time: " + std::to_string(diff1.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "WRITE2|Time: " + std::to_string(diff2.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "WRITE3|Time: " + std::to_string(diff3.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "WRITE4|Time: " + std::to_string(diff4.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "WRITE5|Time: " + std::to_string(diff5.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "WRITE6|Time: " + std::to_string(diff6.count()) + ", Path: " + path + "\n";
+    logger->log(info);
     return len;
 }
 
@@ -1859,7 +2078,16 @@ int fs_open(const char *path, struct fuse_file_info *fi)
 int fs_read(const char *path, char *buf, size_t len, off_t offset,
 	    struct fuse_file_info *fi)
 {
+    auto t0 = std::chrono::system_clock::now();
+    const std::shared_lock<std::shared_mutex> ckpting_lock(ckpting_mutex);
     struct objfs *fs = (struct objfs*) fuse_get_context()->private_data;
+
+    {
+        std::unique_lock<std::mutex> sync_lk(sync_mutex);
+        writing_log_count++;
+    }
+    auto t1 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff1 = t1 - t0;
 
     int inum;
     if (fi->fh != 0) {
@@ -1871,6 +2099,8 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
     if (inum < 0){
         return inum;
     }
+    t0 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff2 = t0 - t1;
 
     inode_mutex.lock_shared();
     fs_obj *obj = inode_map[inum];
@@ -1883,6 +2113,8 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
     size_t bytes = 0;
     
     f->read_lock();
+    t1 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff3 = t1 - t0;
     for (auto it = f->extents.lookup(offset);
 	 len > 0 && it != f->extents.end(); it++) {
 	    auto [base, e] = *it;
@@ -1913,7 +2145,26 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
             len -= _len;
         }
     }
+    t0 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff4 = t0 - t1;
     f->read_unlock();
+    {
+        std::unique_lock<std::mutex> sync_lk(sync_mutex);
+        writing_log_count--;
+    }
+    t1 = std::chrono::system_clock::now();
+    std::chrono::duration<double> diff5 = t1 - t0;
+
+    std::string info = "READ1|Time: " + std::to_string(diff1.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "READ2|Time: " + std::to_string(diff2.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "READ3|Time: " + std::to_string(diff3.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "READ4|Time: " + std::to_string(diff4.count()) + ", Path: " + path + "\n";
+    logger->log(info);
+    info = "READ5|Time: " + std::to_string(diff5.count()) + ", Path: " + path + "\n";
+    logger->log(info);
     return bytes;
 }
 
@@ -2031,6 +2282,377 @@ int fs_fsync(const char * path, int, struct fuse_file_info *fi)
 
     return 0;
 }
+
+// TODO: enable fifo to store old data that's recently read
+void fifo() {
+    int fifo_limit = 1000000000;
+    std::unique_lock lk(fifo_mutex);
+    while (true) {
+        if (quit_fifo) {
+            cache_mutex.lock();
+            while (fifo_size > 0) {
+                std::pair<int, int> *pair = fifo_queue.front();
+                free(pair);
+                pair = NULL;
+                fifo_queue.pop();
+                fifo_size--;
+            }
+            for (auto it = data_log_cache.begin(); it != data_log_cache.end(); it++) {
+                auto [objnum, data_extents] = *it;
+                for (auto it2 = data_extents->begin(); it2 != data_extents->end(); it2++) {
+                    auto [offset, ext] = *it2;
+                    free(ext);
+                    ext = NULL;
+                }
+                data_extents->clear();
+            }
+            data_log_cache.clear();
+            cache_mutex.unlock();
+            quit_fifo = false;
+            cv.notify_all();
+            printf("quit fifo\n");
+            return;
+        }
+        fifo_cv.wait(lk, [&fifo_limit]{return (fifo_size.load() > fifo_limit)||quit_fifo;});
+        while (fifo_size > fifo_limit) {
+            cache_mutex.lock();
+            std::pair<int, int> *pair = fifo_queue.front();
+            int objnum = pair->first;
+            int offset = pair->second;
+            free(pair);
+            pair = NULL;
+            fifo_queue.pop();
+            fifo_size--;
+
+            free((*data_log_cache[objnum])[offset]);
+            (*data_log_cache[objnum])[offset] = NULL;
+            data_log_cache[objnum]->erase(offset);
+            cache_mutex.unlock();
+        }
+    }
+}
+
+void checkpoint(struct objfs *fs)
+{
+    {
+        std::unique_lock<std::mutex> sync_lk(sync_mutex);
+        writing_log_count++;
+    }
+    ckpting_mutex.lock();
+    if (quit_ckpt) {
+        ckpting_mutex.unlock();
+        return;
+    }
+    put_before_ckpt = false;
+    log_mutex.lock();
+    int ckpted_s3_index;
+    if (data_offset() != 0 && meta_offset() != 0) {
+        ckpted_s3_index = next_s3_index.load(); // When fs_init, do not load objects with index [0, ckpted_s3_index]
+        {
+            std::unique_lock<std::mutex> sync_lk(sync_mutex);
+            writing_log_count++;
+        }
+        write_everything_out(fs);
+    } else { // If there is nothing in log, then don't write_everything_out
+        ckpted_s3_index = next_s3_index.load() - 1;
+        put_before_ckpt = true;
+        log_mutex.unlock();
+    }
+
+    char _key[1024];
+    
+    if (ckpt_index == -1) {
+        ckpt_index++;
+    }
+    ckpt_index++;
+    sprintf(_key, "%s.%08x.ck", fs->prefix, ckpt_index.load());
+    std::string key(_key);
+
+    ckpt_header h;
+    std::stringstream objs;
+    int objs_size = serialize_all(ckpted_s3_index, &h, objs);
+    std::string str = objs.str();
+
+    struct iovec iov[2] = {{.iov_base = (void*)&h, .iov_len = sizeof(h)},
+        {.iov_base = (void *)(str.c_str()), .iov_len = (size_t)objs_size}};
+    
+    {
+        std::unique_lock<std::mutex> ckpt_lk(ckpt_put_mutex);
+        using namespace std::literals::chrono_literals;
+        ckpt_cv.wait_for(ckpt_lk, 500ms, []{return put_before_ckpt;});
+    }
+    started_gc = true;
+    ckpting_mutex.unlock();
+
+    printf("writing %s, objs size: %d\n", key.c_str(), objs_size);
+    std::future<S3Status> status = std::async(std::launch::deferred, &s3_target::s3_put, fs->s3, key, iov, 2);
+    
+    if (S3StatusOK != status.get()){
+        printf("CHECKPOINT PUT FAILED\n");
+        throw "put failed";
+    }
+
+    {
+        std::unique_lock<std::mutex> sync_lk(sync_mutex);
+        writing_log_count--;
+    }
+    gc_range = ckpted_s3_index;
+    gc_timer_cv.notify_all();
+}
+
+void checkpoint_timer(struct objfs *fs)
+{
+    using namespace std::literals::chrono_literals;
+    std::unique_lock<std::mutex> lk(cv_m);
+    while (true) {
+        cv.wait_for(lk, 5000ms, []{return quit_ckpt;});
+        checkpoint(fs);
+        if (quit_ckpt) {
+            quit_ckpt = false;
+            cv.notify_all();
+            printf("quit checkpoint_timer\n");
+            return;
+        }
+    }
+}
+
+void gc_timer(struct objfs *fs)
+{
+    using namespace std::literals::chrono_literals;
+    std::unique_lock<std::mutex> lk(gc_timer_m);
+    int prev_gc_range = 0;
+    while (true) {
+        gc_timer_cv.wait(lk, [&prev_gc_range]{return prev_gc_range < gc_range.load() || quit_gc;});
+        if (quit_gc) {
+            quit_gc = false;
+            cv.notify_all();
+            printf("quit gc_timer\n");
+            return;
+        }
+        //gc_file(fs);
+        gc_obj(fs, gc_range);
+        prev_gc_range = gc_range;
+    }
+}
+
+void gc_write(struct objfs *fs, void *buf, size_t len, int inum, int file_offset)
+{
+    // TODO: improve started_gc_mutex
+    started_gc_mutex.lock();
+    if (truncs_after_ckpt.find(inum) != truncs_after_ckpt.end()){
+        int t_len = truncs_after_ckpt.at(inum);
+        if (t_len <= file_offset) {
+            started_gc_mutex.unlock();
+            return;
+        }
+        if (t_len <= file_offset + (int)len) {
+            len = t_len - file_offset;
+        }
+    }
+    std::map<int, int> *writes;
+    if (writes_after_ckpt.find(inum) != writes_after_ckpt.end()){
+        writes = writes_after_ckpt[inum];
+
+        int w_offset, w_len;
+        for (auto it = writes->begin(); it != writes->end(); it++)
+        {
+            w_offset = it->first;
+            w_len = it->second;
+
+            if (w_offset + w_len <= file_offset) continue;
+            if (w_offset >= file_offset + (int)len) break;
+            int skip = w_offset + w_len - file_offset;
+            if (w_offset <= file_offset) {
+                buf = (void *)buf + skip;
+                file_offset += skip;
+                len -= skip;
+                continue;
+            }
+
+            gc_write_extent(buf, inum, file_offset, w_offset - file_offset);
+            buf = (void *)buf + skip;
+            file_offset += skip;
+            len -= skip;
+        }
+    }
+    if (len > 0) {
+        gc_write_extent(buf, inum, file_offset, len);
+    }
+    started_gc_mutex.unlock();
+    maybe_write(fs);
+}
+
+void gc_write_extent(void *buf, int inum, int file_offset, int len) {
+    int hdr_bytes = sizeof(log_record) + sizeof(log_data);
+    char hdr[hdr_bytes];
+    log_record *lr = (log_record*) hdr;
+    log_data *ld = (log_data*) lr->data;
+
+    lr->type = LOG_DATA;
+    lr->len = sizeof(log_data);
+
+    fs_file *f = (fs_file *)inode_map[inum];
+    f->read_lock();
+    off_t new_size = std::max((off_t)(file_offset+len), (off_t)(f->size));
+    f->read_unlock();
+
+    log_mutex.lock();
+    size_t obj_offset = data_offset();
+    *ld = (log_data) { .inum = (uint32_t)inum,
+            .obj_offset = (uint32_t)obj_offset,
+            .file_offset = (int64_t)file_offset,
+            .size = (int64_t)new_size,
+            .len = (uint32_t)len};
+
+
+    memcpy(meta_log_tail, hdr, hdr_bytes);
+    meta_log_tail = hdr_bytes + (char*)meta_log_tail;
+    if (len > 0) {
+        memcpy(data_log_tail, buf, len);
+        data_log_tail = len + (char*)data_log_tail;
+    }
+
+    extent e = {.objnum = (uint32_t)next_s3_index,
+        .offset = (uint32_t)obj_offset, .len = (uint32_t)len};
+    log_mutex.unlock();
+
+    f->write_lock();
+    f->size = new_size;
+    f->extents.update(file_offset, e);
+    f->write_unlock();
+}
+
+void gc_read_write(struct objfs *fs, int filenum, void *infos_ptr, std::set<int> *objnum_to_delete){
+    std::vector<gc_info *> *infos = (std::vector<gc_info *> *)infos_ptr;
+    if (infos == NULL || infos->size() == 0) return;
+    for (auto it = infos->begin(); it != infos->end(); it++) {
+        gc_info *info = *it;
+        if (objnum_to_delete->find(info->objnum) == objnum_to_delete->end()) continue;
+        char buf[info->len];
+        read_data(fs, (void *)buf, info->objnum, info->obj_offset, info->len);
+        //do_read(fs, info->objnum, (void *)buf, (size_t)info->len, (size_t)info->obj_offset, false);
+        gc_write(fs, (void *)buf, info->len, filenum, info->file_offset);
+    }
+}
+
+void get_total_file_size(int inum, std::map<int, int> &total_file_sizes, std::map<int, std::vector<gc_info *> *> &gc_infos){
+    fs_obj *obj = inode_map[inum];
+
+    if (obj->type == OBJ_FILE) {
+        fs_file *file = (fs_file *)obj;
+        for (auto it = file->extents.begin(); it != file->extents.end(); it++) {
+            auto [file_offset, ext] = *it;
+            if (total_file_sizes.find(ext.objnum) == total_file_sizes.end()) {
+                total_file_sizes[ext.objnum] = ext.len;
+            } else {
+                total_file_sizes[ext.objnum] = total_file_sizes[ext.objnum] + ext.len;
+            }
+            if (gc_infos.find(inum) == gc_infos.end()) {
+                std::vector<gc_info *>* infos = new std::vector<gc_info *>;
+                gc_infos[inum] = infos;
+            }
+            gc_info* info = (gc_info *) malloc(sizeof(gc_info));
+            info->objnum = ext.objnum;
+            info->file_offset = file_offset;
+            info->obj_offset = ext.offset;
+            info->len = ext.len;
+            //gc_infos[ext.objnum]->push_back(info);
+            gc_infos[inum]->push_back(info);
+        }
+    }
+    else if (obj->type == OBJ_DIR) {
+	    fs_directory *dir = (fs_directory*)obj;
+        for (auto it = dir->dirents.begin(); it != dir->dirents.end(); it++) {
+            auto [name,inum2] = *it;
+            get_total_file_size(inum2, total_file_sizes, gc_infos);
+        }
+    }
+}
+
+void gc_obj(struct objfs *fs, int ckpted_s3_index){
+
+    int root_inum = 2;
+
+    std::map<int, int>  total_file_sizes; // keys are obj No.s, vals are total valid data sizes per obj
+    std::map<int, std::vector<gc_info *> *> gc_infos;
+    get_total_file_size(root_inum, total_file_sizes, gc_infos);
+
+    std::list<std::string> keys;
+    if (S3StatusOK != fs->s3->s3_list(fs->prefix, keys))
+        throw "bucket list failed";
+
+    if (quit_gc) {
+        return;
+    }
+
+    int n;
+    char postfix[10];
+    std::set<int> objnum_to_delete;
+
+    for (auto it = keys.begin(); it != keys.end(); it++) {
+        sscanf(it->c_str(), "%*[^.].%08x%s", &n, postfix); 
+        if (strcmp(postfix, ".ck") == 0) {
+            postfix[0] = '\0';
+            continue;
+        }
+        if (n == 0) continue;
+        if (n > ckpted_s3_index) break;
+
+        float util_rate = (float) total_file_sizes[n] / (float) get_datalen(fs, n, false);
+        printf("OBJ NUM %d UTIL RATE %f\n", n, util_rate);
+        if (util_rate > 0.8) {
+            continue;
+        }
+        objnum_to_delete.insert(n);
+        printf("OBJECT %s to be deleted\n", it->c_str());
+    }
+
+    if (objnum_to_delete.size() > 0) {
+        for (auto it = gc_infos.begin(); it != gc_infos.end(); it++) {
+            int filenum = it->first;
+            std::vector<gc_info*>* infos = it->second;
+            gc_read_write(fs, filenum, (void *)infos, &objnum_to_delete);
+            printf("FILE %d to be GCed\n", filenum);
+        }
+    }
+
+    started_gc_mutex.lock();
+    started_gc = false;
+    writes_after_ckpt.clear();
+    truncs_after_ckpt.clear();
+    started_gc_mutex.unlock();
+    gc_infos.clear();
+
+    log_mutex.lock();
+    if (data_offset() != 0 && meta_offset() != 0) {
+        {
+            std::unique_lock<std::mutex> sync_lk(sync_mutex);
+            writing_log_count++;
+        }
+        printf("Additional GC write everything out\n");
+        write_everything_out(fs);
+    } else {
+        log_mutex.unlock();
+    }
+
+    postfix[0] = '\0';
+    // TODO: maybe remove checkpoints
+    // Remove old objects where we already read and wrote valid data again in new objects
+    for(std::set<int>::iterator it = objnum_to_delete.begin(); it != objnum_to_delete.end(); ++it) {
+        n = *it;
+        
+        char _key[1024];
+        sprintf(_key, "%s.%08x", fs->prefix, n);
+        std::future<S3Status> status = std::async(std::launch::deferred, &s3_target::s3_delete, fs->s3, _key);
+        
+        if (S3StatusOK != status.get()){
+            printf("DELETE FAILED\n");
+            throw "delete failed";
+        }
+    }
+    printf("GC obj finished\n");
+}
+
 
 void *fs_init(struct fuse_conn_info *conn)
 {

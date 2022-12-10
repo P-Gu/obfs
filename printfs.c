@@ -92,7 +92,7 @@ struct obj_header {
     int32_t version;
     int32_t type;		// 1 == data, 2 == metadata
     int32_t hdr_len;
-    int32_t this_index;
+    int32_t next_s3_index;
     char    data[];
 };
 
@@ -158,7 +158,7 @@ int main(int argc, char **argv)
 
     struct obj_header *oh = (void*)buf;
     printf("size %d\nmagic %x\nversion %d\ntype %d\nhdr_len %d\nindex %d\n",
-           size, oh->magic, oh->version, oh->type, oh->hdr_len, oh->this_index);
+           size, oh->magic, oh->version, oh->type, oh->hdr_len, oh->next_s3_index);
 
     printout(buf, sizeof(*oh));
     int meta_bytes = oh->hdr_len - sizeof(struct obj_header);
