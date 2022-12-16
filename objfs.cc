@@ -4,18 +4,15 @@
   Uses data objects and metadata objects. Data objects form a logical
   log, and are a complete record of the file system. Metadata objects
   roll up all changes into a read-optimized form.
-
  */
 
 /* data objects:
    - header (length, version, yada yada)
    - metadata (log records)
    - file data
-
    data is always in the current object, and is identified by offsets
    from the beginning of the file data section. (simplifies assembling
    the object before writing it out)
-
    all offsets are in units of bytes, even if we do R/M/W of 4KB pages
    of file data. This limits us to 4GB objects, which should be OK.
    when it's all done we'll check the space requirements for going to
@@ -46,6 +43,7 @@
 #include <atomic>
 #include <future>
 #include <shared_mutex>
+#include <condition_variable>
 
 #include <sys/uio.h>
 #include <list>
@@ -57,18 +55,62 @@
 #include <thread>
 #include <chrono>
 #include <fstream>
+#include <queue>
+#include <ctime>
 
 std::shared_mutex inode_mutex;
 std::mutex log_mutex;
-std::shared_mutex old_log_mutex;
+std::shared_mutex buffer_mutex;
+std::shared_mutex cache_mutex;
+std::shared_mutex stale_data_mutex;
+std::shared_mutex ckpting_mutex;  // checkpoint() holds this mutex so that inode map and fs_obj's cannot be modified
+std::mutex ckpt_put_mutex; // checkpoint() holds this mutex and wait for write_everything_out to confirm successful put to backend
+std::mutex sync_mutex;
+std::mutex fifo_mutex;
+std::condition_variable cv;
+std::condition_variable ckpt_cv;
+std::condition_variable sync_cv; // Don't sync before all regular write_everything_out is done
+std::condition_variable fifo_cv;
+std::condition_variable gc_timer_cv;
+std::mutex cv_m;
+std::mutex gc_timer_m;
+std::mutex logger_mutex;
+std::shared_mutex started_gc_mutex;
+std::shared_mutex data_offsets_mutex;
+std::shared_mutex data_lens_mutex;
+bool quit_fifo;
+bool quit_ckpt;
+bool quit_gc;
+bool put_before_ckpt; // In checkpoint(), check if write_everything_out completed before serialize_all
+bool started_gc;  // After gc starts, this sets to true. fs_write and fs_truncate are recorded so that gc_write doesn't overwrite
 
+std::atomic<int> writing_log_count (0); // Counts how many write_everything_out() for regular logs is executing
+std::atomic<int> gc_range (0);   // GC all normal s3 objects before and including this index
+std::atomic<int> fifo_size (0);
+std::atomic<int> next_s3_index (1);
 std::atomic<int> next_inode (3); // the root "" has inum 2
+std::atomic<int> ckpt_index (-1); // record the latest checkpoint object index
+int f_bsize = 4096;
+
 std::mutex next_inode_mutex;
+
+// Write Buffer
 std::map<int, void *> meta_log_buffer; // Before a log object is commited to back end, it sits here for read requests
 std::map<int, void *> data_log_buffer; // keys are object indices, values are objects
-std::map<int, size_t> meta_log_sizes; 
-std::map<int, size_t> data_log_sizes;
+std::map<int, size_t> meta_log_buffer_sizes; 
+std::map<int, size_t> data_log_buffer_sizes;
+
+// Read Cache
+//std::map<int, void *> meta_log_cache;
+std::map<int, std::map<int, void *> *> data_log_cache;
+//std::map<int, size_t> meta_log_cache_sizes; 
+std::map<int, std::map<int, size_t> *> data_log_cache_sizes;
+
 std::map<int, void *> written_inodes;
+std::queue<std::pair<int, int> *> fifo_queue;
+std::map<int, std::map<int, int> *> writes_after_ckpt;  // first key is inum, second key is offset, value is len
+std::map<int, int> truncs_after_ckpt;  // first key is inum, second key means fs_truncate off_t len
+std::map<int, int> file_stale_data;
 
 //typedef int (*fuse_fill_dir_t) (void *buf, const char *name,
 //                                const struct stat *stbuf, off_t off);
@@ -280,6 +322,7 @@ struct extent_xp {
     
 class fs_file : public fs_obj {
     std::shared_mutex   mtx;  // Read-Write Lock
+    std::mutex rd_mutex; // Lock for read_data()
 public:
     extmap  extents;
     size_t length(void);
@@ -297,6 +340,12 @@ public:
     }
     void read_unlock(){
         mtx.unlock_shared();
+    }
+    void rd_lock() {
+        rd_mutex.lock();
+    }
+    void rd_unlock(){
+        rd_mutex.unlock();
     }
 };
 
@@ -506,7 +555,7 @@ void Logger::log(std::string info) {
     file_stream << info;
 }
 
-Logger* logger = new Logger("/mnt/ramdisk/log_ckpt2.txt");
+Logger* logger = new Logger("/mnt/ramdisk/log_ckpt3.txt");
 
 /****************
  * file header format
@@ -1055,6 +1104,12 @@ size_t meta_offset(void)
 }
 
 void write_inode(fs_obj *f);
+void gc_file(struct objfs *);
+void gc_obj(struct objfs *, int);
+void gc_write(struct objfs *, const char *, size_t, int, int);
+void gc_write_extent(void *, int, int, int);
+void gc_read_write(struct objfs *, std::vector<gc_info *> *);
+void get_total_file_size(int, std::map<int, int> &, std::map<int, std::vector<gc_info *> *> &);
 
 int verbose;
 
@@ -1224,7 +1279,7 @@ int get_offset(struct objfs *fs, int index, bool ckpt)
 // read @len bytes of file data from object @index starting at
 // data offset @offset (need to adjust for header length)
 //
-int read_data(struct objfs *fs, void *buf, int index, off_t offset, size_t len)
+int read_data(struct objfs *fs, void *f_ptr, void *buf, int index, off_t offset, size_t len)
 {
     auto t0 = std::chrono::system_clock::now();
     log_mutex.lock();
@@ -1277,6 +1332,9 @@ int read_data(struct objfs *fs, void *buf, int index, off_t offset, size_t len)
     int left_do_read_offset, right_do_read_offset;
     int cur_ext_offset = ((int)offset / f_bsize) * f_bsize;
     left_do_read_offset = cur_ext_offset;
+
+    fs_file *f = (fs_file *)f_ptr;
+    f->rd_lock();
     if (data_log_cache.find(index) != data_log_cache.end()) {
         data_extents = data_log_cache[index];
 
@@ -1329,6 +1387,7 @@ int read_data(struct objfs *fs, void *buf, int index, off_t offset, size_t len)
         std::chrono::duration<double> diff4 = t4 - t3;
         info = "RD4|Time: " + std::to_string(diff4.count()) + ", Len: " + std::to_string(len) + "\n";
         logger->log(info);
+        f->rd_unlock();
         return bytes_read;
     }
     cache_mutex.unlock_shared();
@@ -1343,6 +1402,7 @@ int read_data(struct objfs *fs, void *buf, int index, off_t offset, size_t len)
     //int do_read_resp = do_read(fs, index, data_log, data_len, hdr_len, false);
     int do_read_resp = do_read(fs, index, data_log, right_do_read_offset - left_do_read_offset, hdr_len + left_do_read_offset, false);
     if (do_read_resp < 0){
+        f->rd_unlock();
         return -1;
     }
     
@@ -1377,6 +1437,7 @@ int read_data(struct objfs *fs, void *buf, int index, off_t offset, size_t len)
     std::chrono::duration<double> diff6 = t6 - t5;
     info = "RD6|Time: " + std::to_string(diff6.count()) + ", Len: " + std::to_string(len) + "\n";
     logger->log(info);
+    f->rd_unlock();
     return len;
 }
 
@@ -2134,7 +2195,7 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
             size_t _len = e.len - skip;  // length of buffer to consume (unmapped=skip,mapped)
             if (_len > len)
                 _len = len;
-            if (read_data(fs, buf, e.objnum, e.offset+skip, _len) < 0){
+            if (read_data(fs, (void *)f, buf, e.objnum, e.offset+skip, _len) < 0){
                 f->read_unlock();
                 return -EIO;
             }
@@ -2529,7 +2590,7 @@ void gc_read_write(struct objfs *fs, int filenum, void *infos_ptr, std::set<int>
         gc_info *info = *it;
         if (objnum_to_delete->find(info->objnum) == objnum_to_delete->end()) continue;
         char buf[info->len];
-        read_data(fs, (void *)buf, info->objnum, info->obj_offset, info->len);
+        read_data(fs, NULL, (void *)buf, info->objnum, info->obj_offset, info->len);
         //do_read(fs, info->objnum, (void *)buf, (size_t)info->len, (size_t)info->obj_offset, false);
         gc_write(fs, (void *)buf, info->len, filenum, info->file_offset);
     }
